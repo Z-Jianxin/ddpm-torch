@@ -1,7 +1,8 @@
 import math
 import torch
 from .functions import normal_kl, discretized_gaussian_loglik, flat_mean
-
+import numpy as np
+import torchode as to
 
 def _warmup_beta(beta_start, beta_end, timesteps, warmup_frac, dtype):
     betas = beta_end * torch.ones(timesteps, dtype=dtype)
@@ -172,6 +173,105 @@ class GaussianDiffusion:
             t.fill_(ti)
             x_t = self.p_sample_step(denoise_fn, x_t, t, generator=rng)
         return x_t
+    
+    def approx_sample_step(self, denoise_fn, x_t, t, n, gaussians, clip_denoised=False):
+        model_mean, _, model_logvar, pred_x_0 = self.p_mean_var(
+            denoise_fn, x_t, t, clip_denoised=clip_denoised, return_pred=True)
+        nonzero_mask = (t > 0).reshape((-1,) + (1,) * (x_t.ndim - 1)).to(x_t)
+        beta_t = torch.tensor(self.timesteps) * self.betas[t.detach().cpu()[0].item()]
+        ################Wiener's Representation################
+        t = t.float() / 1000.0
+        cos_nt = torch.cos(np.pi * n[:, None] * t)  # Shape: [K, batch_size]
+        cos_nt = torch.transpose(cos_nt, 0, 1) # Shape: [batch_size, K]
+        # gaussians should now has shape B * C * W * H * K
+        sum_cos_nt = torch.sum(gaussians[:, :, :, :, 1:] * cos_nt[:, None, None, None, :], dim=-1)
+        # diff = torch.exp(0.5 * model_logvar) * torch.sqrt(torch.tensor(self.timesteps))
+        # gt = torch.sqrt(torch.tensor(self.timesteps * self.betas[(t*1000).long()[0]]))
+        gt = torch.sqrt(beta_t)
+        bm_int_approx = gt*(torch.sqrt(torch.tensor(2.0))*sum_cos_nt+gaussians[:, :, :, :, 0])/self.timesteps
+        ################Wiener's Representation################
+        #drift = - 0.5 * beta_t * x_t - beta_t * out / torch.sqrt(1-beta_t/self.timesteps)
+        #sample = x_t - drift/self.timesteps - nonzero_mask * bm_int_approx
+        sample = model_mean + nonzero_mask * bm_int_approx
+        return sample
+
+    @torch.inference_mode()
+    def approx_sample(self, denoise_fn, shape=None, device=torch.device("cpu"), noise=None, seed=None, K=40):
+        B = (shape or noise.shape)[0]
+        t = torch.empty((B, ), dtype=torch.int64, device=device)
+        ################Wiener's Representation################
+        gaussians = torch.randn(B, *shape[1:], K+1).to(device)
+        n = torch.arange(1, K+1, dtype=torch.float32).to(device)
+        ################Wiener's Representation################
+        rng = None
+        if seed is not None:
+            rng = torch.Generator(device).manual_seed(seed)
+        if noise is None:
+            x_t = torch.empty(shape, device=device).normal_(generator=rng)
+        else:
+            x_t = noise.to(device)
+        for ti in range(self.timesteps - 1, -1, -1):
+            t.fill_(ti)
+            x_t = self.approx_sample_step(denoise_fn, x_t, t, n, gaussians)
+        return x_t
+    
+    @torch.inference_mode()
+    def approx_sample_ode_sovler(
+        self,
+        denoise_fn,
+        shape=None,
+        device=torch.device("cpu"),
+        noise=None,
+        seed=None,
+        K=10,
+        atol=1e-6,
+        rtol=1e-4
+    ):
+        B = (shape or noise.shape)[0]
+        ################Wiener's Representation################
+        gaussians = torch.randn(B, *shape[1:], K+1).to(device)
+        n = torch.arange(1, K+1, dtype=torch.float32).to(device)
+        ################Wiener's Representation################
+        rng = None
+        if seed is not None:
+            rng = torch.Generator(device).manual_seed(seed)
+        if noise is None:
+            x_t = torch.empty(shape, device=device).normal_(generator=rng)
+        else:
+            x_t = noise.to(device)
+        def fun(t, x):
+            x = x.reshape(*shape)
+            t_int = torch.round(t * 1000).long()
+            model_mean, _, model_logvar, pred_x_0 = self.p_mean_var(
+                denoise_fn,
+                x,
+                t_int,
+                clip_denoised=False,
+                return_pred=True
+            )
+            #nonzero_mask = (t_int > 0).reshape((-1,) + (1,) * (x.ndim - 1)).to(x)
+            ################Wiener's Representation################
+            cos_nt = torch.cos(np.pi * n[:, None] * t)  # Shape: [K, batch_size]
+            cos_nt = torch.transpose(cos_nt, 0, 1) # Shape: [batch_size, K]
+            # gaussians should now has shape B * C * W * H * K
+            sum_cos_nt = torch.sum(gaussians[:, :, :, :, 1:] * cos_nt[:, None, None, None, :], dim=-1)
+            diff = torch.exp(0.5 * model_logvar) * torch.sqrt(torch.tensor(self.timesteps))
+            dB = diff*(torch.sqrt(torch.tensor(2.0))*sum_cos_nt+gaussians[:, :, :, :, 0])
+            ################Wiener's Representation################
+            # sample = (x-model_mean) * (self.timesteps) + nonzero_mask * dB
+            sample = (x-model_mean) * (self.timesteps) + dB
+            return sample.reshape((sample.shape[0], -1))
+        term = to.ODETerm(fun)
+        step_method = to.Dopri5(term=term)
+        step_size_controller = to.IntegralController(atol=atol, rtol=rtol, term=term)
+        solver = to.AutoDiffAdjoint(step_method, step_size_controller)
+        jit_solver = torch.compile(solver)
+        t_start = torch.ones(B, dtype=torch.float32).to(device) * 0.999
+        t_end = torch.zeros(B, dtype=torch.float32).to(device)
+        sol = jit_solver.solve(to.InitialValueProblem(y0=x_t.reshape((x_t.shape[0], -1)), t_start=t_start, t_end=t_end))
+        samples = sol.ys.squeeze(1).reshape(*shape)
+        print(sol.stats['n_f_evals'].float().mean(), sol.stats['n_steps'].float().mean())
+        return samples
 
     @torch.inference_mode()
     def p_sample_progressive(

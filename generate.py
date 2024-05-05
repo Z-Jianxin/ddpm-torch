@@ -71,7 +71,8 @@ def generate(rank, args, counter=0):
     if use_ema:
         state_dict = torch.load(chkpt_path, map_location=device)["ema"]["shadow"]
     else:
-        state_dict = torch.load(chkpt_path, map_location=device)["model"]
+        # print(torch.load(chkpt_path, map_location=device).keys())
+        state_dict = torch.load(chkpt_path, map_location=device) # ["model"]
     for k in list(state_dict.keys()):
         if k.startswith("module."):  # state_dict of DDP
             state_dict[k.split(".", maxsplit=1)[1]] = state_dict.pop(k)
@@ -110,7 +111,21 @@ def generate(rank, args, counter=0):
         for i in range(local_num_batches):
             if i == local_num_batches - 1:
                 shape = (local_total_size - i * batch_size, 3, image_res, image_res)
-            x = diffusion.p_sample(model, shape=shape, device=device, noise=torch.randn(shape, device=device)).cpu()
+            #x = diffusion.p_sample(model, shape=shape, device=device, noise=torch.randn(shape, device=device)).cpu()
+            noise = torch.randn(shape, device=device)
+            if args.use_approx == 0:
+                x = diffusion.p_sample(model, shape=shape, device=device, noise=noise).cpu()
+            else:
+                '''x = diffusion.approx_sample(model, shape=shape, device=device, noise=noise).cpu()'''
+                x = diffusion.approx_sample_ode_sovler(
+                    model,
+                    shape=shape,
+                    device=device,
+                    noise=noise,
+                    K = args.K,
+                    atol = 1e-6,
+                    rtol = 1e-3
+                ).cpu()
             x = (x * 127.5 + 127.5).round().clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1).numpy()
             pool.map(save_image, list(x))
             if isinstance(counter, Synchronized):
@@ -139,7 +154,8 @@ def main():
     parser.add_argument("--suffix", default="", type=str)
     parser.add_argument("--max-workers", default=8, type=int)
     parser.add_argument("--num-gpus", default=1, type=int)
-
+    parser.add_argument("--K", default=20, type=int)
+    parser.add_argument("--use-approx", default=0, type=int)
     args = parser.parse_args()
 
     world_size = args.world_size = args.num_gpus or 1
